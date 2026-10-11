@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Your own links, written by the script next to itself
+links.json
+
+.vscode/
+.idea/
