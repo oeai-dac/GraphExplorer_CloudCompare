@@ -6,8 +6,9 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0">
-  <img src="https://img.shields.io/badge/CloudCompare-2.13%2B-4A90D9" alt="CloudCompare 2.13+">
+  <img src="https://img.shields.io/badge/version-0.1.1-blue" alt="Version 0.1.1">
+  <img src="https://img.shields.io/badge/CloudCompare-2.13-4A90D9" alt="CloudCompare 2.13">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(Flatpak)-lightgrey" alt="Windows | Linux (Flatpak)">
   <img src="https://img.shields.io/badge/License-GPL--3.0-green" alt="License">
 </p>
 
@@ -51,7 +52,7 @@ flowchart LR
 - **Several links side by side** — e.g. one for the units and one for the finds
 - **Match report** — shows which names appear in both, which only in CloudCompare and which only in the graph
 - **Clever selection** — click a find in the GraphExplorer, and CloudCompare selects the unit it was found in
-- **CloudCompare 2.13 and newer**, with its Python plugin — no compiling, no extra installation
+- **CloudCompare 2.13 on Windows, the Flatpak version on Linux**, with its Python plugin — no compiling, no extra installation
 
 ---
 
@@ -59,7 +60,10 @@ flowchart LR
 
 ### What you need
 
-- **CloudCompare 2.13 or newer** with its **Python plugin**. On Windows, the installer offers the Python plugin as an option — make sure it is ticked during installation process. You can check: if there is a *Python Plugin* entry in CloudCompare's *Plugins* menu, you are set. Otherwise you can also install the *Python Plugin* afterwards from https://github.com/tmontaigu/CloudCompare-PythonRuntime. 
+- **CloudCompare** with its **Python plugin**. You can check: if there is a *Python Plugin* entry in CloudCompare's *Plugins* menu, you are set.
+  - **Windows:** CloudCompare **2.13**. The installer offers the Python plugin as an option — make sure it is ticked during the installation process. Otherwise you can also install the *Python Plugin* afterwards from https://github.com/tmontaigu/CloudCompare-PythonRuntime.
+  - **Linux:** the Flatpak version from [Flathub](https://flathub.org/apps/org.cloudcompare.CloudCompare) (`flatpak install flathub org.cloudcompare.CloudCompare`). It already includes the Python plugin.
+  - **CloudCompare 2.14 (beta) on Windows** does not yet include the Qt bindings for Python that the script needs, so the script does not run there yet.
 - The **[GraphExplorer](https://github.com/oeai-dac/GraphExplorer#installation)** — installed, or simply its single standalone HTML file. The script does not include its own copy: it connects to the GraphExplorer you already use.
 
 ### Get the script
@@ -74,15 +78,17 @@ git clone https://github.com/oeai-dac/GraphExplorer_CloudCompare.git
 
 Choose a folder you can write to, **not** `C:\Program Files`: the script saves your links in a file next to it.
 
-The folder contains three files that belong together:
+The folder contains five files that belong together:
 
 | File | Content |
 |---|---|
 | `graphexplorer_cc_link.py` | the script you run in CloudCompare |
 | `config_dialog.py` | the dialog for the links |
 | `linking.py` | the matching of names — the same as in the QGIS plugin and the Blender add-on |
+| `websocket.py` | the connection to the GraphExplorer — the same as in the Blender add-on |
+| `qtcompat.py` | lets the script work with the Qt version of your CloudCompare |
 
-There is nothing to install: CloudCompare runs the script directly. To update, replace the three files with the new ones. To remove it, delete the folder.
+There is nothing to install: CloudCompare runs the script directly. To update, replace the files with the new ones. To remove it, delete the folder.
 
 ---
 
@@ -275,7 +281,13 @@ The connection keeps running with the code it was started with. Restart CloudCom
 
 ### Python instead of C++
 
-Native CloudCompare plugins are written in C++ and have to be compiled against the exact CloudCompare, Qt and compiler versions they run with. The Python plugin of CloudCompare 2.13 ships Python 3.10, PyQt5 (including `QtWebSockets`) and `pycc`, the Python bindings to CloudCompare — everything the link needs. PyQt5 and CloudCompare share the same Qt libraries in one process, so a `QWebSocketServer` and `QTimer` created by the script run in CloudCompare's own event loop: no threads, and the user interface stays responsive.
+Native CloudCompare plugins are written in C++ and have to be compiled against the exact CloudCompare, Qt and compiler versions they run with. The Python plugin ships Python, Qt bindings for Python and `pycc`, the Python bindings to CloudCompare — everything the link needs.
+
+Which Qt bindings depends on the build: CloudCompare 2.13 for Windows comes with Qt 5 and PyQt5, the Flatpak version for Linux with Qt 6 and PySide6. `qtcompat.py` picks the binding that matches the Qt library CloudCompare has *already loaded* — not simply the first one that can be imported: a binding for the other Qt would bring a second, foreign Qt into the process, which does not see CloudCompare's application. It also smooths over the few differences the script runs into (enums, `exec`). The binding and CloudCompare share the same Qt libraries in one process, so the dialog and the timers created by the script run in CloudCompare's own event loop, and the user interface stays responsive.
+
+### A WebSocket server without Qt
+
+The server (`websocket.py`) uses only Python's standard library — it is the same file as in the Blender add-on. Not every Qt binding includes `QtWebSockets` (in PySide6 it is a separate add-on package), the standard library is always there. The server reads in a background thread and never touches CloudCompare: it puts incoming messages into a queue, and a timer on the main thread picks them up every 50 ms — `pycc` and Qt may only be used from there. One GraphExplorer at a time: while one is connected, further connections are refused.
 
 ### Why the GraphExplorer runs in the browser
 
@@ -283,15 +295,15 @@ The script runs a small WebSocket server on `127.0.0.1`, and the GraphExplorer �
 
 ### Staying alive after the script ends
 
-The script returns as soon as the server is running. The link object is kept in `builtins`, so it outlives the script's namespace; its timer and server keep running in CloudCompare's event loop. Running the script again finds the running link there and opens its dialog instead of starting a second one.
+The script returns as soon as the server is running. The link object is kept in `builtins`, so it outlives the script's namespace; its timers keep running in CloudCompare's event loop, the server in its background thread. Running the script again finds the running link there and opens its dialog instead of starting a second one.
 
 ### No “selection changed” signal
 
 `pycc` offers no signal for a changed selection. A timer (every 250 ms) compares the current selection with the last one it saw; every sixth tick it also re-reads the DB tree and matches again if entities were added, removed or renamed. Entities are read fresh each time and never kept between ticks: a Python reference to an entity that was deleted in CloudCompare would point to freed memory.
 
-### Callbacks outside the socket
+### Callbacks after the messages
 
-Answers from the GraphExplorer are handled right *after* the socket's signal, not inside it (`QTimer.singleShot(0, …)`). A callback may open a message box — **Check matches** does — and its event loop would otherwise deliver further messages into the socket's unfinished slot. Every Qt callback is also wrapped so that an exception only ends up in the console: an unhandled exception in a PyQt slot would terminate CloudCompare.
+Answers from the GraphExplorer are handled right *after* the messages picked up from the queue, not in the middle of them (`QTimer.singleShot(0, …)`). A callback may open a message box — **Check matches** does — and its event loop would otherwise process further messages while the previous one is unfinished. Every Qt callback is also wrapped so that an exception only ends up in the console: an unhandled exception in a PyQt5 slot would terminate CloudCompare.
 
 ### Protocol
 
@@ -339,12 +351,14 @@ Without a lock, the two sides would select each other endlessly. When a selectio
 
 ```
 GraphExplorer_CloudCompare/
-├── graphexplorer_cc_link.py   server, protocol, DB tree, selection, timer, start
-├── config_dialog.py           the links dialog (PyQt5 only, no pycc)
+├── graphexplorer_cc_link.py   protocol, DB tree, selection, timers, start
+├── config_dialog.py           the links dialog (Qt only, no pycc)
+├── qtcompat.py                PyQt5 or PySide6 — whichever matches CloudCompare's Qt
+├── websocket.py               the WebSocket server, standard library only — identical to the Blender add-on
 └── linking.py                 the matching itself — identical to the QGIS plugin and the Blender add-on
 ```
 
-Only `graphexplorer_cc_link.py` imports `pycc`; the dialog and the matching can be run and tested with CloudCompare's Python outside of CloudCompare. `linking.py` is kept character for character identical to the one in the QGIS plugin and the Blender add-on — it speaks of *layers* and *features*, and `config_dialog.py` translates its report into CloudCompare terms for display. Code comments are in German.
+Only `graphexplorer_cc_link.py` imports `pycc`; the dialog, the server and the matching can be run and tested with Python and a Qt binding outside of CloudCompare. `websocket.py` is kept character for character identical to the one in the Blender add-on, `linking.py` to the one in the QGIS plugin and the Blender add-on — it speaks of *layers* and *features*, and `config_dialog.py` translates its report into CloudCompare terms for display. Code comments are in German.
 
 </details>
 

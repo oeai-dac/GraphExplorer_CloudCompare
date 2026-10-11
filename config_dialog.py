@@ -9,22 +9,7 @@ bekommt er als Funktionen hereingereicht. Damit lässt er sich auch außerhalb
 von CloudCompare öffnen und prüfen.
 """
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QMessageBox,
-    QPushButton,
-    QVBoxLayout,
-)
+from qtcompat import QtCore, QtWidgets, enum, run_modal
 
 from linking import (
     DEFAULT_PATTERN,
@@ -37,6 +22,23 @@ from linking import (
     LinkConfig,
     LinkIndex,
 )
+
+Qt = QtCore.Qt
+QApplication = QtWidgets.QApplication
+QCheckBox = QtWidgets.QCheckBox
+QComboBox = QtWidgets.QComboBox
+QDialog = QtWidgets.QDialog
+QDialogButtonBox = QtWidgets.QDialogButtonBox
+QFormLayout = QtWidgets.QFormLayout
+QHBoxLayout = QtWidgets.QHBoxLayout
+QLabel = QtWidgets.QLabel
+QLineEdit = QtWidgets.QLineEdit
+QListWidget = QtWidgets.QListWidget
+QMessageBox = QtWidgets.QMessageBox
+QPushButton = QtWidgets.QPushButton
+QVBoxLayout = QtWidgets.QVBoxLayout
+
+TOOLTIP_ROLE = enum(Qt, "ItemDataRole.ToolTipRole")
 
 
 def is_usable(link):
@@ -200,7 +202,8 @@ class LinkConfigDialog(QDialog):
         self.btn_check.clicked.connect(self._on_check)
         outer.addWidget(self.btn_check)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(enum(QDialogButtonBox, "StandardButton.Ok")
+                                   | enum(QDialogButtonBox, "StandardButton.Cancel"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
@@ -277,7 +280,7 @@ class LinkConfigDialog(QDialog):
         for entry in self._graph_info.get("types", []):
             self.cb_type.addItem("%s  (%d)" % (self.names.type(entry["type"]), entry["count"]),
                                  entry["type"])
-            self.cb_type.setItemData(self.cb_type.count() - 1, entry["type"], Qt.ToolTipRole)
+            self.cb_type.setItemData(self.cb_type.count() - 1, entry["type"], TOOLTIP_ROLE)
         self.cb_type.blockSignals(False)
 
     def _refill_attrs(self):
@@ -288,7 +291,7 @@ class LinkConfigDialog(QDialog):
             if entry["type"] == wanted:
                 for attr in entry.get("attrs", []):
                     self.cb_attr.addItem(self.names.attr(attr), attr)
-                    self.cb_attr.setItemData(self.cb_attr.count() - 1, attr, Qt.ToolTipRole)
+                    self.cb_attr.setItemData(self.cb_attr.count() - 1, attr, TOOLTIP_ROLE)
                 break
         self.cb_attr.blockSignals(False)
 
@@ -369,7 +372,7 @@ class LinkConfigDialog(QDialog):
             box.setWindowTitle("Matches")
             box.setText(cc_wording(report.summary()))
             box.setDetailedText(cc_wording(report.details()))
-            box.exec_()
+            run_modal(box)
 
         self._check_fn(link.js_spec(), done)
 

@@ -1,12 +1,16 @@
 """GraphExplorer Link for CloudCompare -- Prototyp.
 
-In CloudCompare 2.13 (mit Python-Plugin) im Python-Editor öffnen und
-ausführen.
+In CloudCompare (mit Python-Plugin) im Python-Editor öffnen und ausführen --
+2.13 unter Windows (Qt 5, PyQt5) oder die Flatpak-Fassung unter Linux (Qt 6,
+PySide6); welche Bindung gilt, entscheidet ``qtcompat.py``.
 
 - **Erster Lauf:** startet einen WebSocket-Server und öffnet den Dialog mit
   der Verbindungsadresse und den Verknüpfungen (die Adresse steht außerdem in
   der Konsole und in der Zwischenablage). Das Skript kehrt danach zurück; die
   Kopplung läuft über Qt-Timer in der Ereignisschleife von CloudCompare weiter.
+  Der Server selbst (``websocket.py``, nur Standardbibliothek) liest in einem
+  Hintergrundfaden; ein schneller Timer holt seine Nachrichten auf den
+  Hauptfaden, denn ``pycc`` und Qt dürfen nur von dort angefasst werden.
 - **Jeder weitere Lauf:** öffnet den Dialog wieder. Die Verbindung bleibt
   dabei bestehen. Wer geänderten Code der Kopplung selbst laden will, muss
   CloudCompare neu starten.
@@ -16,7 +20,7 @@ wird automatisch über das Knotenlabel verknüpft, und zwar mit *jedem*
 Knotentyp, bei dem mindestens ein Name im DB-Tree passt.
 
 Protokoll und Zuordnung (``linking.py``) sind dieselben wie im
-Blender-Addon; ``linking.py`` ist eine unveränderte Kopie.
+Blender-Addon; ``linking.py`` und ``websocket.py`` sind unveränderte Kopien.
 """
 
 import builtins
@@ -29,11 +33,6 @@ import sys
 import traceback
 
 import pycc
-from PyQt5.QtCore import QThread, QTimer
-from PyQt5.QtGui import QGuiApplication
-from PyQt5.QtNetwork import QHostAddress
-from PyQt5.QtWebSockets import QWebSocketServer
-from PyQt5.QtWidgets import QApplication, QMainWindow
 
 try:
     HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,14 +44,25 @@ except NameError:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import qtcompat  # noqa: E402
 import linking  # noqa: E402
+import websocket  # noqa: E402
 import config_dialog  # noqa: E402
 
 importlib.reload(linking)  # damit ein erneuter Lauf Änderungen sieht
+importlib.reload(websocket)
 importlib.reload(config_dialog)
+
+QTimer = qtcompat.QtCore.QTimer
+QThread = qtcompat.QtCore.QThread
+QGuiApplication = qtcompat.QtGui.QGuiApplication
+QApplication = qtcompat.QtWidgets.QApplication
+QMainWindow = qtcompat.QtWidgets.QMainWindow
+QDialog = qtcompat.QtWidgets.QDialog
 
 HOST_NAME = "CloudCompare"
 EXPECTED_API_VERSION = 2
+IO_MS = 50              # so oft die Nachrichten des Servers abholen
 TICK_MS = 250
 TREE_EVERY = 6          # DB-Tree nur jeden n-ten Tick neu einlesen
 DESCRIBE_EVERY = 8      # ohne Graph: so oft nachfragen, ob inzwischen einer da ist
@@ -85,7 +95,8 @@ def guarded(fn):
     """Ausnahmen in Qt-Rückrufen abfangen.
 
     PyQt5 beendet bei einer unbehandelten Ausnahme in einem Slot den ganzen
-    Prozess -- hier also CloudCompare. Ein Fehler im Prototyp darf aber nur in
+    Prozess -- hier also CloudCompare (PySide6 schreibt sie nur hin, aber
+    einheitlich ist besser). Ein Fehler im Prototyp darf aber nur in
     der Konsole stehen, nicht die offene Sitzung kosten.
     """
     def wrapper(*args):
@@ -121,13 +132,13 @@ def save_links(links):
 
 
 def main_window():
-    """Das Hauptfenster von CloudCompare, als PyQt-Objekt -- oder ``None``.
+    """Das Hauptfenster von CloudCompare, als Qt-Objekt der Bindung -- oder ``None``.
 
     Als Elternfenster hält es den Dialog über CloudCompare, ohne ihn über alle
     anderen Programme zu legen (wo er beim Einfügen der Adresse im Browser
-    stören würde). ``pycc`` liefert das Fenster nicht als PyQt-Objekt; PyQt und
-    CloudCompare teilen sich aber dieselbe Qt-Bibliothek, also findet es sich
-    unter den Fenstern der Anwendung.
+    stören würde). ``pycc`` liefert das Fenster nicht als Qt-Objekt; die
+    Bindung und CloudCompare teilen sich aber dieselbe Qt-Bibliothek, also
+    findet es sich unter den Fenstern der Anwendung.
     """
     for widget in QApplication.topLevelWidgets():
         if isinstance(widget, QMainWindow) and widget.isVisible():
@@ -169,12 +180,13 @@ class CCLink(object):
     def __init__(self):
         self.cc = pycc.GetInstance()
         self.token = secrets.token_urlsafe(16)
-        self.server = QWebSocketServer("GraphExplorer Link", QWebSocketServer.NonSecureMode)
-        if not self.server.listen(QHostAddress(QHostAddress.LocalHost), 0):
-            raise RuntimeError("Could not open a port: " + self.server.errorString())
-        self.server.newConnection.connect(guarded(self._on_new_connection))
+        self.server = websocket.WebSocketServer()
+        try:
+            self.port = self.server.start("127.0.0.1", 0)
+        except OSError as e:
+            raise RuntimeError("Could not open a port: %s" % e)
+        self.running = True
 
-        self.sock = None
         self.authed = False
         self.api_version = None
         self.pending = {}
@@ -194,52 +206,57 @@ class CCLink(object):
         self.dialog = None         # der offene Dialog, falls einer offen ist
         self.match_summary = ""
 
+        self.io_timer = QTimer()
+        self.io_timer.timeout.connect(guarded(self._pump))
+        self.io_timer.start(IO_MS)
         self.timer = QTimer()
         self.timer.timeout.connect(guarded(self._tick))
         self.timer.start(TICK_MS)
 
     @property
     def address(self):
-        return "ws://127.0.0.1:%d/?token=%s" % (self.server.serverPort(), self.token)
+        return "ws://127.0.0.1:%d/?token=%s" % (self.port, self.token)
+
+    def is_running(self):
+        return self.running
 
     def stop(self):
+        self.running = False
+        self.io_timer.stop()
         self.timer.stop()
-        if self.sock is not None:
-            self.sock.close()
-        self.server.close()
+        self.server.stop()
 
     # -- Leitung -------------------------------------------------------------
 
-    def _on_new_connection(self):
-        sock = self.server.nextPendingConnection()
-        if sock is None:
-            return
-        if self.sock is not None:
-            # Eine Seite zur Zeit -- die neue ersetzt die alte, wie beim
-            # Neuladen des Explorers.
-            self.sock.close()
-        self.sock = sock
-        self.authed = False
-        sock.textMessageReceived.connect(guarded(self._on_message))
-        sock.disconnected.connect(guarded(lambda s=sock: self._on_disconnected(s)))
+    def _pump(self):
+        """Was der Server-Faden empfangen hat, hier auf dem Hauptfaden abarbeiten."""
+        for kind, data in self.server.poll():
+            if kind == "open":
+                guarded(self._on_open)()
+            elif kind == "message":
+                guarded(self._on_message)(data)
+            elif kind == "close":
+                guarded(self._on_close)()
 
-    def _on_disconnected(self, sock):
-        if sock is not self.sock:
-            return
-        self.sock = None
+    def _on_open(self):
+        # Eine Seite zur Zeit: Solange eine verbunden ist, weist der Server
+        # weitere ab. Lädt man den Explorer neu, schließt der Browser die alte
+        # Verbindung vorher.
+        self.authed = False
+
+    def _on_close(self):
+        was_authed = self.authed
         self.authed = False
         self.sent_specs = None
         pending, self.pending = self.pending, {}
         for callback in pending.values():
             guarded(callback)(None)
-        log("Connection to the GraphExplorer closed. Paste the same address again to reconnect.")
+        if was_authed:
+            log("Connection to the GraphExplorer closed. Paste the same address again to reconnect.")
         self._update_status()
 
     def _send(self, payload):
-        if self.sock is None:
-            return False
-        self.sock.sendTextMessage(json.dumps(payload, ensure_ascii=False))
-        return True
+        return self.server.send(json.dumps(payload, ensure_ascii=False))
 
     def call(self, method, args=None, callback=None):
         message = {"method": method, "args": list(args or [])}
@@ -272,17 +289,16 @@ class CCLink(object):
                 self._describe()
             else:
                 log("Connection without a valid token refused.")
-                self.sock.close()
+                self.server.drop_client()
             return
 
         if "id" in msg:
             callback = self.pending.pop(msg["id"], None)
             if callback:
-                # Nicht hier im Slot des Sockets ausführen, sondern gleich
-                # danach: Ein Rückruf darf ein Meldungsfenster öffnen, und
-                # dessen Ereignisschleife würde sonst weitere Nachrichten in
-                # denselben, noch nicht zurückgekehrten Slot schieben -- daran
-                # stürzt QWebSocket ab.
+                # Nicht hier mitten in _pump ausführen, sondern gleich danach:
+                # Ein Rückruf darf ein Meldungsfenster öffnen, und dessen
+                # Ereignisschleife würde sonst weitere Nachrichten abarbeiten,
+                # während die vorige noch nicht fertig ist.
                 result = msg.get("result")
                 QTimer.singleShot(0, lambda: guarded(callback)(result))
             return
@@ -446,7 +462,8 @@ class CCLink(object):
 
     def _on_dialog_finished(self, result):
         dialog, self.dialog = self.dialog, None
-        if dialog is None or result != dialog.Accepted:
+        accepted = qtcompat.enum(QDialog, "DialogCode.Accepted")
+        if dialog is None or qtcompat.as_int(result) != qtcompat.as_int(accepted):
             return
         self.links = dialog.links()
         try:
@@ -539,13 +556,13 @@ class CCLink(object):
 
 def start():
     running = getattr(builtins, "_graphexplorer_cc_link", None)
-    if running is not None and hasattr(running, "open_dialog") and running.server.isListening():
+    if running is not None and hasattr(running, "is_running") and running.is_running():
         # Schon verbunden: Ein zweiter Lauf soll die Verbindung nicht kappen,
         # sondern das öffnen, was man dann meistens will -- die Einstellungen.
         running.open_dialog()
         return
     if running is not None:
-        # Eine Kopplung aus einer älteren Fassung dieses Skripts, ohne Dialog.
+        # Eine Kopplung aus einer älteren Fassung dieses Skripts.
         try:
             running.stop()
         except Exception:
@@ -553,7 +570,13 @@ def start():
         log("Previous link stopped.")
 
     app = QGuiApplication.instance()
-    if app is not None and QThread.currentThread() != app.thread():
+    if app is None:
+        # Die Bindung sieht die Qt-Anwendung von CloudCompare nicht -- dann
+        # gehört sie zu einer anderen Qt als CloudCompare selbst.
+        raise RuntimeError("%s does not share CloudCompare's Qt. Use the Qt bindings "
+                           "that come with CloudCompare's Python plugin." % qtcompat.BINDING)
+    log("Using %s." % qtcompat.BINDING)
+    if QThread.currentThread() != app.thread():
         log("Warning: not running in the GUI thread -- timers may not fire.")
 
     link = CCLink()
